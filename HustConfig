@@ -16,31 +16,11 @@ local maxDistance = 2000            -- alcance do aimbot (studs)
 local espDistance = 2000            -- alcance do ESP (studs)
 local fovRadius = 150               -- raio da bola em pixels
 local BIND_NAME = "CameraLockHead"
-local TELEPORT_DISTANCE = 20        -- studs pra frente
 
 local lockEnabled = false
 local currentTarget = nil
 local espEnabled = false
 local espObjects = {}
-
--- Aimbot (opções extras)
-local aimPartMode = "Tronco"        -- "Tronco" ou "Cabeça"
-local priorityMode = "Centro da tela" -- "Centro da tela", "Mais perto", "Menor vida"
-local smoothness = 0                -- 0 = instantâneo, 95 = bem suave
-local wallCheck = false             -- só trava em quem está visível
-local teamCheck = false             -- ignora quem é do seu time
-local predictionEnabled = false     -- previsão de movimento
-local predictionMs = 100            -- milissegundos de previsão
-local holdMode = false              -- só trava segurando botão direito
-local showTracer = true             -- linha até o alvo
-
--- Free cam
-local fcEnabled = false
-local fcSpeed = 50
-local fcYaw, fcPitch = 0, 0
-local fcPos = Vector3.zero
-local fcControls = nil
-local fcAnchoredRoot = nil
 
 -- Amigos que o aimbot ignora (nome de usuário, não DisplayName)
 local IGNORE_LIST = {
@@ -60,9 +40,6 @@ local syncEsp = function() end
 ----------------------------------------------------------------
 -- CAMERA LOCK
 ----------------------------------------------------------------
-local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Exclude
-
 local function getHead(plr)
 	local char = plr.Character
 	if not char then return nil end
@@ -79,45 +56,19 @@ local function getAimPart(plr)
 	if not char then return nil end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	if not hum or hum.Health <= 0 then return nil end
-	if aimPartMode == "Cabeça" then
-		local head = char:FindFirstChild("Head")
-		if head then return head end
-	end
 	return char:FindFirstChild("UpperTorso")
 		or char:FindFirstChild("Torso")
 		or char:FindFirstChild("HumanoidRootPart")
 end
 
-local function getAimPos(part)
-	if predictionEnabled then
-		return part.Position + part.AssemblyLinearVelocity * (predictionMs / 1000)
-	end
-	return part.Position
-end
-
-local function isVisible(part, plr)
-	local ignore = {camera}
-	if player.Character then
-		table.insert(ignore, player.Character)
-	end
-	rayParams.FilterDescendantsInstances = ignore
-	local origin = camera.CFrame.Position
-	local res = workspace:Raycast(origin, part.Position - origin, rayParams)
-	return res == nil or res.Instance:IsDescendantOf(plr.Character)
-end
-
-local function isTeammate(plr)
-	return teamCheck and plr.Team ~= nil and plr.Team == player.Team
-end
-
--- Procura o melhor player dentro da bola
+-- Procura o player mais perto do centro da tela, dentro da bola
 local function findBestTarget()
-	local best, bestScore = nil, math.huge
+	local best, bestDist = nil, math.huge
 	local camPos = camera.CFrame.Position
 	local center = camera.ViewportSize / 2
 
 	for _, plr in ipairs(Players:GetPlayers()) do
-		if plr ~= player and not isIgnored(plr) and not isTeammate(plr) then
+		if plr ~= player and not isIgnored(plr) then
 			local part = getAimPart(plr)
 			if part then
 				local worldDist = (part.Position - camPos).Magnitude
@@ -125,20 +76,9 @@ local function findBestTarget()
 					local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
 					if onScreen and screenPos.Z > 0 then
 						local fromCenter = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
-						if fromCenter <= fovRadius and (not wallCheck or isVisible(part, plr)) then
-							local score
-							if priorityMode == "Mais perto" then
-								score = worldDist
-							elseif priorityMode == "Menor vida" then
-								local hum = plr.Character:FindFirstChildOfClass("Humanoid")
-								score = hum and hum.Health or math.huge
-							else
-								score = fromCenter
-							end
-							if score < bestScore then
-								bestScore = score
-								best = plr
-							end
+						if fromCenter <= fovRadius and fromCenter < bestDist then
+							bestDist = fromCenter
+							best = plr
 						end
 					end
 				end
@@ -158,21 +98,12 @@ local function toggle()
 end
 
 RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, function()
-	if fcEnabled then return end
 	if not lockEnabled then return end
-
-	if holdMode and not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
-		currentTarget = nil
-		return
-	end
 
 	-- mantém o alvo até ele chegar a 0 de HP (ou sair do alcance / do jogo)
 	if currentTarget then
 		local part = getAimPart(currentTarget)
-		if not part
-			or (part.Position - camera.CFrame.Position).Magnitude > maxDistance
-			or isTeammate(currentTarget)
-			or (wallCheck and not isVisible(part, currentTarget)) then
+		if not part or (part.Position - camera.CFrame.Position).Magnitude > maxDistance then
 			currentTarget = nil
 		end
 	end
@@ -186,13 +117,7 @@ RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, fun
 		local part = getAimPart(currentTarget)
 		if part then
 			local camPos = camera.CFrame.Position
-			local goal = CFrame.new(camPos, getAimPos(part))
-			if smoothness > 0 then
-				local alpha = math.clamp(1 - smoothness / 100, 0.03, 1)
-				camera.CFrame = camera.CFrame:Lerp(goal, alpha)
-			else
-				camera.CFrame = goal
-			end
+			camera.CFrame = CFrame.new(camPos, part.Position)
 		end
 	end
 end)
@@ -338,127 +263,6 @@ local function toggleEsp()
 end
 
 ----------------------------------------------------------------
--- FREE CAM + TELEPORTAR
-----------------------------------------------------------------
-local function getOwnHumanoid()
-	local char = player.Character
-	return char and char:FindFirstChildOfClass("Humanoid")
-end
-
-local function getControls()
-	local ok, controls = pcall(function()
-		local scripts = player:FindFirstChild("PlayerScripts")
-		local module = scripts and scripts:FindFirstChild("PlayerModule")
-		return module and require(module):GetControls()
-	end)
-	return ok and controls or nil
-end
-
-local function startFreeCam()
-	if fcEnabled then return end
-	fcEnabled = true
-
-	local cf = camera.CFrame
-	fcPos = cf.Position
-	fcPitch, fcYaw = cf:ToOrientation()
-	camera.CameraType = Enum.CameraType.Scriptable
-
-	if UserInputService.KeyboardEnabled then
-		-- PC: desliga o controle do personagem pra ele não andar junto
-		fcControls = getControls()
-		if fcControls then
-			fcControls:Disable()
-		end
-	else
-		-- celular: usa o joystick pra mover a câmera e prende o corpo
-		local char = player.Character
-		local root = char and char:FindFirstChild("HumanoidRootPart")
-		if root and not root.Anchored then
-			root.Anchored = true
-			fcAnchoredRoot = root
-		end
-	end
-end
-
-local function stopFreeCam()
-	if not fcEnabled then return end
-	fcEnabled = false
-
-	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-	if fcControls then
-		fcControls:Enable()
-		fcControls = nil
-	end
-	if fcAnchoredRoot then
-		fcAnchoredRoot.Anchored = false
-		fcAnchoredRoot = nil
-	end
-
-	camera.CameraType = Enum.CameraType.Custom
-	local hum = getOwnHumanoid()
-	if hum then
-		camera.CameraSubject = hum
-	end
-end
-
-local function updateFreeCam(dt)
-	if not fcEnabled then return end
-
-	if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
-		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
-	elseif UserInputService.MouseBehavior == Enum.MouseBehavior.LockCurrentPosition then
-		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-	end
-
-	local rot = CFrame.fromOrientation(fcPitch, fcYaw, 0)
-	local move = Vector3.zero
-
-	if UserInputService.KeyboardEnabled then
-		if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += rot.LookVector end
-		if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= rot.LookVector end
-		if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += rot.RightVector end
-		if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= rot.RightVector end
-	else
-		local hum = getOwnHumanoid()
-		if hum and hum.MoveDirection.Magnitude > 0 then
-			move += hum.MoveDirection
-		end
-	end
-	if UserInputService:IsKeyDown(Enum.KeyCode.E) then move += Vector3.yAxis end
-	if UserInputService:IsKeyDown(Enum.KeyCode.Q) then move -= Vector3.yAxis end
-
-	if move.Magnitude > 0 then
-		local speed = fcSpeed
-		if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
-			speed = speed * 3
-		end
-		fcPos += move.Unit * speed * dt
-	end
-
-	camera.CFrame = CFrame.new(fcPos) * rot
-end
-
-local function teleportForward()
-	local char = player.Character
-	if not char then return end
-	local root = char:FindFirstChild("HumanoidRootPart")
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	if not root or not hum then return end
-
-	local offset = root.CFrame.LookVector * TELEPORT_DISTANCE
-	local seat = hum.SeatPart
-
-	if seat then
-		-- sentado: leva o seat e tudo que está preso a ele (veículo, personagem, etc.)
-		for _, part in ipairs(seat:GetConnectedParts(true)) do
-			part.CFrame = part.CFrame + offset
-		end
-	else
-		char:PivotTo(char:GetPivot() + offset)
-	end
-end
-
-----------------------------------------------------------------
 -- INTERFACE (estilo Hub)
 ----------------------------------------------------------------
 local C = {
@@ -515,15 +319,6 @@ local circleStroke = new("UIStroke", {
 	Color = C.accent,
 	Thickness = 1.5,
 }, circle)
-
--- Linha até o alvo
-local tracer = new("Frame", {
-	AnchorPoint = Vector2.new(0.5, 0.5),
-	Size = UDim2.fromOffset(0, 1.5),
-	BackgroundColor3 = Color3.fromRGB(70, 200, 100),
-	BorderSizePixel = 0,
-	Visible = false,
-}, circleGui)
 
 -- Janela principal
 local WIN_SIZE = UDim2.fromOffset(500, 320)
@@ -645,13 +440,11 @@ local function addTab(name, order)
 		BorderSizePixel = 0,
 		Font = Enum.Font.GothamBold,
 		TextSize = 13,
-		TextScaled = true,
 		TextColor3 = C.sub,
 		Text = name,
 		AutoButtonColor = false,
 	}, sidebar)
 	corner(btn, 8)
-	new("UITextSizeConstraint", {MaxTextSize = 13, MinTextSize = 8}, btn)
 
 	local page = new("ScrollingFrame", {
 		Name = name,
@@ -706,22 +499,6 @@ local function addInfo(page, text)
 		Text = text,
 	}, page)
 	return l
-end
-
-local function addButton(page, text, callback)
-	local btn = new("TextButton", {
-		Size = UDim2.new(1, 0, 0, 36),
-		BackgroundColor3 = C.accent,
-		BorderSizePixel = 0,
-		Font = Enum.Font.GothamBold,
-		TextSize = 13,
-		TextColor3 = Color3.new(1, 1, 1),
-		Text = text,
-		AutoButtonColor = true,
-	}, page)
-	corner(btn, 8)
-	btn.Activated:Connect(callback)
-	return btn
 end
 
 local function addToggle(page, text, default, callback)
@@ -829,8 +606,7 @@ end
 -- Abas
 local aimPage = addTab("Aimbot", 1)
 local espPage = addTab("ESP", 2)
-local camPage = addTab("Free cam", 3)
-local cfgPage = addTab("Config", 4)
+local cfgPage = addTab("Config", 3)
 
 -- Aba Aimbot
 addSection(aimPage, "AIMBOT")
@@ -855,45 +631,6 @@ addToggle(aimPage, "Mostrar bola FOV", true, function(v)
 	circle.Visible = v
 end)
 
-addSection(aimPage, "AJUSTES")
-addInput(aimPage, "Suavidade (0-95)", smoothness, 0, 95, function(v)
-	smoothness = v
-end)
-
-local partBtn
-partBtn = addButton(aimPage, "Mirar em: " .. aimPartMode, function()
-	aimPartMode = (aimPartMode == "Tronco") and "Cabeça" or "Tronco"
-	partBtn.Text = "Mirar em: " .. aimPartMode
-end)
-
-local PRIORITIES = {"Centro da tela", "Mais perto", "Menor vida"}
-local priorityBtn
-priorityBtn = addButton(aimPage, "Prioridade: " .. priorityMode, function()
-	local idx = table.find(PRIORITIES, priorityMode) or 1
-	priorityMode = PRIORITIES[(idx % #PRIORITIES) + 1]
-	priorityBtn.Text = "Prioridade: " .. priorityMode
-	currentTarget = nil
-end)
-
-addToggle(aimPage, "Checar parede (só visíveis)", false, function(v)
-	wallCheck = v
-end)
-addToggle(aimPage, "Ignorar meu time", false, function(v)
-	teamCheck = v
-end)
-addToggle(aimPage, "Só segurando botão direito", false, function(v)
-	holdMode = v
-end)
-addToggle(aimPage, "Previsão de movimento", false, function(v)
-	predictionEnabled = v
-end)
-addInput(aimPage, "Previsão (ms)", predictionMs, 0, 500, function(v)
-	predictionMs = v
-end)
-addToggle(aimPage, "Linha até o alvo", true, function(v)
-	showTracer = v
-end)
-
 addSection(aimPage, "STATUS")
 local statusLabel = addInfo(aimPage, "Lock: DESATIVADO")
 local targetLabel = addInfo(aimPage, "Alvo: —")
@@ -914,25 +651,6 @@ end
 addInput(espPage, "Alcance (studs)", espDistance, 50, 10000, function(v)
 	espDistance = v
 end)
-
--- Aba Free cam
-addSection(camPage, "FREE CAM")
-addToggle(camPage, "Soltar câmera do corpo", false, function(v)
-	if v then
-		startFreeCam()
-	else
-		stopFreeCam()
-	end
-end)
-addInput(camPage, "Velocidade", fcSpeed, 1, 1000, function(v)
-	fcSpeed = v
-end)
-addInfo(camPage, "PC: WASD move, Q/E desce/sobe, Shift acelera")
-addInfo(camPage, "PC: segure botão direito pra girar a câmera")
-addInfo(camPage, "Celular: joystick move, arraste a tela pra girar")
-
-addSection(camPage, "TELEPORTE")
-addButton(camPage, "Teleportar", teleportForward)
 
 -- Aba Config
 addSection(cfgPage, "TECLAS")
@@ -1003,23 +721,8 @@ end
 
 makeDraggable(topBar, window)
 
--- Giro da free cam (botão direito no PC / arrastar no celular)
-UserInputService.InputChanged:Connect(function(input, gameProcessed)
-	if not fcEnabled then return end
-
-	if input.UserInputType == Enum.UserInputType.MouseMovement then
-		if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
-			fcYaw = fcYaw - input.Delta.X * 0.003
-			fcPitch = math.clamp(fcPitch - input.Delta.Y * 0.003, -1.5, 1.5)
-		end
-	elseif input.UserInputType == Enum.UserInputType.Touch and not gameProcessed then
-		fcYaw = fcYaw - input.Delta.X * 0.004
-		fcPitch = math.clamp(fcPitch - input.Delta.Y * 0.004, -1.5, 1.5)
-	end
-end)
-
 -- Atualização ao vivo
-RunService.RenderStepped:Connect(function(dt)
+RunService.RenderStepped:Connect(function()
 	local locked = currentTarget ~= nil
 
 	dot.BackgroundColor3 = lockEnabled and Color3.fromRGB(70, 200, 100) or Color3.fromRGB(200, 60, 60)
@@ -1033,33 +736,17 @@ RunService.RenderStepped:Connect(function(dt)
 
 	circleStroke.Color = locked and Color3.fromRGB(70, 200, 100) or C.accent
 
-	local tracerShown = false
 	if locked then
 		targetLabel.Text = "Alvo: " .. currentTarget.DisplayName
 		local part = getAimPart(currentTarget)
 		if part then
 			distLabel.Text = string.format("Distância: %d studs", math.floor((part.Position - camera.CFrame.Position).Magnitude))
-
-			if showTracer then
-				local sp, onScreen = camera:WorldToViewportPoint(part.Position)
-				if onScreen and sp.Z > 0 then
-					local c = camera.ViewportSize / 2
-					local p = Vector2.new(sp.X, sp.Y)
-					local d = p - c
-					tracer.Size = UDim2.fromOffset(d.Magnitude, 1.5)
-					tracer.Position = UDim2.fromOffset((c.X + p.X) / 2, (c.Y + p.Y) / 2)
-					tracer.Rotation = math.deg(math.atan2(d.Y, d.X))
-					tracerShown = true
-				end
-			end
 		end
 	else
 		targetLabel.Text = "Alvo: —"
 		distLabel.Text = "Distância: —"
 	end
-	tracer.Visible = tracerShown
 
-	updateFreeCam(dt)
 	updateEsp()
 end)
 
