@@ -1,0 +1,557 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+	camera = workspace.CurrentCamera
+end)
+
+local TOGGLE_KEY = Enum.KeyCode.Q   -- liga/desliga o aimbot
+local ESP_KEY = Enum.KeyCode.E      -- liga/desliga o ESP
+local HIDE_KEY = Enum.KeyCode.H     -- esconde/mostra a interface
+local maxDistance = 2000            -- alcance do aimbot (studs)
+local espDistance = 2000            -- alcance do ESP (studs)
+local fovRadius = 150               -- raio da bola em pixels
+local BIND_NAME = "CameraLockHead"
+
+local lockEnabled = false
+local currentTarget = nil
+local espEnabled = false
+local espObjects = {}
+
+-- Amigos que o aimbot ignora (nome de usuário, não DisplayName)
+local IGNORE_LIST = {
+	["rip_vamp29"] = true,
+	["hula2175217576"] = true,
+	["nicolasmarciano3"] = true,
+}
+
+local function isIgnored(plr)
+	return IGNORE_LIST[plr.Name:lower()] == true
+end
+
+----------------------------------------------------------------
+-- CAMERA LOCK
+----------------------------------------------------------------
+local function getHead(plr)
+	local char = plr.Character
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local head = char:FindFirstChild("Head")
+	if hum and head and hum.Health > 0 then
+		return head
+	end
+	return nil
+end
+
+local function getAimPart(plr)
+	local char = plr.Character
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return nil end
+	return char:FindFirstChild("UpperTorso")
+		or char:FindFirstChild("Torso")
+		or char:FindFirstChild("HumanoidRootPart")
+end
+
+-- Procura o player mais perto do centro da tela, dentro da bola
+local function findBestTarget()
+	local best, bestDist = nil, math.huge
+	local camPos = camera.CFrame.Position
+	local center = camera.ViewportSize / 2
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player and not isIgnored(plr) then
+			local part = getAimPart(plr)
+			if part then
+				local worldDist = (part.Position - camPos).Magnitude
+				if worldDist <= maxDistance and worldDist > 0 then
+					local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
+					if onScreen and screenPos.Z > 0 then
+						local fromCenter = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+						if fromCenter <= fovRadius and fromCenter < bestDist then
+							bestDist = fromCenter
+							best = plr
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+local function toggle()
+	lockEnabled = not lockEnabled
+	if not lockEnabled then
+		currentTarget = nil
+	end
+end
+
+RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, function()
+	if not lockEnabled then return end
+
+	-- mantém o alvo até ele chegar a 0 de HP (ou sair do alcance / do jogo)
+	if currentTarget then
+		local part = getAimPart(currentTarget)
+		if not part or (part.Position - camera.CFrame.Position).Magnitude > maxDistance then
+			currentTarget = nil
+		end
+	end
+
+	-- sem alvo: pega o próximo player que estiver dentro da bola
+	if not currentTarget then
+		currentTarget = findBestTarget()
+	end
+
+	if currentTarget then
+		local part = getAimPart(currentTarget)
+		if part then
+			local camPos = camera.CFrame.Position
+			camera.CFrame = CFrame.new(camPos, part.Position)
+		end
+	end
+end)
+
+----------------------------------------------------------------
+-- ESP
+----------------------------------------------------------------
+local function removeEsp(plr)
+	local obj = espObjects[plr]
+	if obj then
+		obj.gui:Destroy()
+		if obj.outline then
+			obj.outline:Destroy()
+		end
+		espObjects[plr] = nil
+	end
+end
+
+local function clearEsp()
+	for plr in pairs(espObjects) do
+		removeEsp(plr)
+	end
+end
+
+local function createEsp(plr, head)
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "ESP_" .. plr.Name
+	bb.Adornee = head
+	bb.AlwaysOnTop = true
+	bb.Size = UDim2.fromOffset(140, 56)
+	bb.StudsOffset = Vector3.new(0, 2.8, 0)
+	bb.ResetOnSpawn = false
+	bb.Parent = player:WaitForChild("PlayerGui")
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Size = UDim2.new(1, 0, 0, 15)
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.TextSize = 13
+	nameLabel.TextColor3 = Color3.new(1, 1, 1)
+	nameLabel.TextStrokeTransparency = 0.3
+	nameLabel.Text = plr.DisplayName
+	nameLabel.Parent = bb
+
+	local barBg = Instance.new("Frame")
+	barBg.Position = UDim2.fromOffset(15, 19)
+	barBg.Size = UDim2.new(1, -30, 0, 8)
+	barBg.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	barBg.BorderSizePixel = 0
+	barBg.Parent = bb
+	Instance.new("UICorner", barBg).CornerRadius = UDim.new(1, 0)
+
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.new(1, 0, 1, 0)
+	fill.BackgroundColor3 = Color3.fromRGB(60, 220, 90)
+	fill.BorderSizePixel = 0
+	fill.Parent = barBg
+	Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+	local info = Instance.new("TextLabel")
+	info.BackgroundTransparency = 1
+	info.Position = UDim2.fromOffset(0, 30)
+	info.Size = UDim2.new(1, 0, 0, 14)
+	info.Font = Enum.Font.GothamMedium
+	info.TextSize = 11
+	info.TextColor3 = Color3.fromRGB(230, 230, 240)
+	info.TextStrokeTransparency = 0.4
+	info.Text = ""
+	info.Parent = bb
+
+	-- contorno azul no corpo todo
+	local outline = Instance.new("Highlight")
+	outline.Name = "ESP_Outline_" .. plr.Name
+	outline.Adornee = plr.Character
+	outline.FillTransparency = 1
+	outline.OutlineTransparency = 0
+	outline.OutlineColor = Color3.fromRGB(0, 140, 255)
+	outline.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	outline.Parent = camera
+
+	espObjects[plr] = {gui = bb, fill = fill, info = info, outline = outline}
+	return espObjects[plr]
+end
+
+local function updateEsp()
+	if not espEnabled then
+		if next(espObjects) then
+			clearEsp()
+		end
+		return
+	end
+
+	local camPos = camera.CFrame.Position
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player then
+			local head = getHead(plr)
+			local show = false
+			local dist = 0
+
+			if head then
+				dist = (head.Position - camPos).Magnitude
+				if dist <= espDistance then
+					local _, onScreen = camera:WorldToViewportPoint(head.Position)
+					show = onScreen
+				end
+			end
+
+			if show then
+				local obj = espObjects[plr]
+				if obj and (not obj.outline.Parent or not obj.gui.Parent) then
+					removeEsp(plr)
+					obj = nil
+				end
+				obj = obj or createEsp(plr, head)
+
+				if obj.gui.Adornee ~= head then
+					obj.gui.Adornee = head
+				end
+				if obj.outline.Adornee ~= plr.Character then
+					obj.outline.Adornee = plr.Character
+				end
+
+				local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+				local ratio = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+				obj.fill.Size = UDim2.new(ratio, 0, 1, 0)
+				obj.fill.BackgroundColor3 = Color3.fromRGB(220, 60, 60):Lerp(Color3.fromRGB(60, 220, 90), ratio)
+				obj.info.Text = string.format("HP %d/%d  |  %d studs", math.floor(hum.Health), math.floor(hum.MaxHealth), math.floor(dist))
+				obj.gui.Enabled = true
+			else
+				removeEsp(plr)
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- INTERFACE
+----------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "CameraLockGui"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = player:WaitForChild("PlayerGui")
+
+-- Bola (FOV) no centro da tela
+local circleGui = Instance.new("ScreenGui")
+circleGui.Name = "CameraLockCircle"
+circleGui.ResetOnSpawn = false
+circleGui.IgnoreGuiInset = true
+circleGui.Parent = player:WaitForChild("PlayerGui")
+
+local circle = Instance.new("Frame")
+circle.AnchorPoint = Vector2.new(0.5, 0.5)
+circle.Position = UDim2.fromScale(0.5, 0.5)
+circle.Size = UDim2.fromOffset(fovRadius * 2, fovRadius * 2)
+circle.BackgroundTransparency = 1
+circle.BorderSizePixel = 0
+circle.Parent = circleGui
+Instance.new("UICorner", circle).CornerRadius = UDim.new(1, 0)
+
+local circleStroke = Instance.new("UIStroke")
+circleStroke.Color = Color3.fromRGB(0, 140, 255)
+circleStroke.Thickness = 1.5
+circleStroke.Parent = circle
+
+local FULL_SIZE = UDim2.fromOffset(240, 272)
+local MINI_SIZE = UDim2.fromOffset(240, 32)
+
+local panel = Instance.new("Frame")
+panel.Name = "Panel"
+panel.Size = FULL_SIZE
+panel.Position = UDim2.new(1, -256, 0.5, -136)
+panel.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+panel.BackgroundTransparency = 0.08
+panel.BorderSizePixel = 0
+panel.ClipsDescendants = true
+panel.Parent = gui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(90, 90, 120)
+stroke.Thickness = 1.5
+stroke.Parent = panel
+
+local titleBar = Instance.new("Frame")
+titleBar.Name = "TitleBar"
+titleBar.Size = UDim2.new(1, 0, 0, 32)
+titleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 44)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = panel
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 10)
+
+local dot = Instance.new("Frame")
+dot.Size = UDim2.fromOffset(10, 10)
+dot.Position = UDim2.fromOffset(12, 11)
+dot.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+dot.BorderSizePixel = 0
+dot.Parent = titleBar
+Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromOffset(30, 0)
+title.Size = UDim2.new(1, -70, 1, 0)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.fromRGB(200, 200, 230)
+title.Text = "Admin Bloco splace"
+title.Parent = titleBar
+
+local minBtn = Instance.new("TextButton")
+minBtn.Size = UDim2.fromOffset(24, 20)
+minBtn.Position = UDim2.new(1, -32, 0, 6)
+minBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+minBtn.BorderSizePixel = 0
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 14
+minBtn.TextColor3 = Color3.fromRGB(230, 230, 240)
+minBtn.Text = "–"
+minBtn.AutoButtonColor = true
+minBtn.Parent = titleBar
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.BackgroundTransparency = 1
+content.Position = UDim2.fromOffset(0, 32)
+content.Size = UDim2.new(1, 0, 1, -32)
+content.Parent = panel
+
+local function makeLabel(y, h, size, color)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Position = UDim2.fromOffset(12, y)
+	l.Size = UDim2.new(1, -24, 0, h)
+	l.Font = Enum.Font.Gotham
+	l.TextSize = size
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextColor3 = color
+	l.Text = ""
+	l.Parent = content
+	return l
+end
+
+local function makeBox(y, text)
+	local b = Instance.new("TextBox")
+	b.Position = UDim2.new(1, -92, 0, y)
+	b.Size = UDim2.fromOffset(80, 24)
+	b.BackgroundColor3 = Color3.fromRGB(40, 40, 58)
+	b.BorderSizePixel = 0
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 13
+	b.TextColor3 = Color3.fromRGB(240, 240, 250)
+	b.ClearTextOnFocus = false
+	b.Text = text
+	b.Parent = content
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+	return b
+end
+
+local statusLabel = makeLabel(4, 18, 13, Color3.fromRGB(230, 230, 240))
+local targetLabel = makeLabel(22, 16, 12, Color3.fromRGB(170, 170, 200))
+local distLabel = makeLabel(38, 16, 12, Color3.fromRGB(170, 170, 200))
+
+-- Alcance do aimbot
+local aimText = makeLabel(62, 22, 12, Color3.fromRGB(170, 170, 200))
+aimText.Text = "Aimbot (studs):"
+local aimBox = makeBox(61, tostring(maxDistance))
+
+aimBox.FocusLost:Connect(function()
+	local n = tonumber(aimBox.Text)
+	if n then
+		maxDistance = math.clamp(math.floor(n), 50, 10000)
+	end
+	aimBox.Text = tostring(maxDistance)
+end)
+
+-- Alcance do ESP
+local espText = makeLabel(92, 22, 12, Color3.fromRGB(170, 170, 200))
+espText.Text = "ESP (studs):"
+local espBox = makeBox(91, tostring(espDistance))
+
+espBox.FocusLost:Connect(function()
+	local n = tonumber(espBox.Text)
+	if n then
+		espDistance = math.clamp(math.floor(n), 50, 10000)
+	end
+	espBox.Text = tostring(espDistance)
+end)
+
+-- Raio da bola
+local fovText = makeLabel(122, 22, 12, Color3.fromRGB(170, 170, 200))
+fovText.Text = "Raio da bola (px):"
+local fovBox = makeBox(121, tostring(fovRadius))
+
+fovBox.FocusLost:Connect(function()
+	local n = tonumber(fovBox.Text)
+	if n then
+		fovRadius = math.clamp(math.floor(n), 20, 1000)
+	end
+	fovBox.Text = tostring(fovRadius)
+	circle.Size = UDim2.fromOffset(fovRadius * 2, fovRadius * 2)
+end)
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Position = UDim2.fromOffset(12, 156)
+toggleBtn.Size = UDim2.new(1, -24, 0, 30)
+toggleBtn.BorderSizePixel = 0
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.TextSize = 13
+toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleBtn.AutoButtonColor = true
+toggleBtn.Parent = content
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
+toggleBtn.Activated:Connect(toggle)
+
+local espBtn = Instance.new("TextButton")
+espBtn.Position = UDim2.fromOffset(12, 194)
+espBtn.Size = UDim2.new(1, -24, 0, 30)
+espBtn.BorderSizePixel = 0
+espBtn.Font = Enum.Font.GothamBold
+espBtn.TextSize = 13
+espBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+espBtn.AutoButtonColor = true
+espBtn.Parent = content
+Instance.new("UICorner", espBtn).CornerRadius = UDim.new(0, 8)
+
+local function toggleEsp()
+	espEnabled = not espEnabled
+	if not espEnabled then
+		clearEsp()
+	end
+end
+espBtn.Activated:Connect(toggleEsp)
+
+-- Minimizar
+local minimized = false
+minBtn.Activated:Connect(function()
+	minimized = not minimized
+	minBtn.Text = minimized and "+" or "–"
+	if minimized then
+		content.Visible = false
+		TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {Size = MINI_SIZE}):Play()
+	else
+		TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {Size = FULL_SIZE}):Play()
+		task.delay(0.1, function()
+			if not minimized then
+				content.Visible = true
+			end
+		end)
+	end
+end)
+
+-- Arrastar (mouse e toque)
+local dragging = false
+local dragStart, startPos
+
+titleBar.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = panel.Position
+
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not dragging then return end
+	if input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch then
+		local delta = input.Position - dragStart
+		panel.Position = UDim2.new(
+			startPos.X.Scale, startPos.X.Offset + delta.X,
+			startPos.Y.Scale, startPos.Y.Offset + delta.Y
+		)
+	end
+end)
+
+-- Atualização ao vivo
+RunService.RenderStepped:Connect(function()
+	local locked = currentTarget ~= nil
+
+	dot.BackgroundColor3 = lockEnabled and Color3.fromRGB(70, 200, 100) or Color3.fromRGB(200, 60, 60)
+	if locked then
+		statusLabel.Text = "Lock: TRAVADO"
+	elseif lockEnabled then
+		statusLabel.Text = "Lock: PROCURANDO"
+	else
+		statusLabel.Text = "Lock: DESATIVADO"
+	end
+	toggleBtn.Text = lockEnabled and "DESATIVAR LOCK  [Q]" or "ATIVAR LOCK  [Q]"
+	toggleBtn.BackgroundColor3 = lockEnabled and Color3.fromRGB(190, 70, 70) or Color3.fromRGB(60, 150, 90)
+
+	espBtn.Text = espEnabled and "DESATIVAR ESP  [E]" or "ATIVAR ESP  [E]"
+	espBtn.BackgroundColor3 = espEnabled and Color3.fromRGB(190, 70, 70) or Color3.fromRGB(70, 110, 190)
+
+	circleStroke.Color = locked and Color3.fromRGB(70, 200, 100) or Color3.fromRGB(0, 140, 255)
+
+	if locked then
+		targetLabel.Text = "Alvo: " .. currentTarget.DisplayName
+		local part = getAimPart(currentTarget)
+		if part then
+			distLabel.Text = string.format("Distância: %d studs", math.floor((part.Position - camera.CFrame.Position).Magnitude))
+		end
+	else
+		targetLabel.Text = "Alvo: —"
+		distLabel.Text = "Distância: —"
+	end
+
+	updateEsp()
+end)
+
+----------------------------------------------------------------
+-- TECLAS
+----------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+
+	if input.KeyCode == TOGGLE_KEY then
+		toggle()
+	elseif input.KeyCode == ESP_KEY then
+		toggleEsp()
+	elseif input.KeyCode == HIDE_KEY then
+		gui.Enabled = not gui.Enabled
+		circleGui.Enabled = gui.Enabled
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+	if plr == currentTarget then
+		currentTarget = nil
+	end
+	removeEsp(plr)
+end)
