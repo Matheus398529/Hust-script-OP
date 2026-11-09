@@ -9,18 +9,48 @@ workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
 	camera = workspace.CurrentCamera
 end)
 
-local TOGGLE_KEY = Enum.KeyCode.Q   -- liga/desliga o aimbot
-local ESP_KEY = Enum.KeyCode.E      -- liga/desliga o ESP
+local TOGGLE_KEY = Enum.KeyCode.J   -- liga/desliga o aimbot
+local ESP_KEY = Enum.KeyCode.Y      -- liga/desliga o ESP
 local HIDE_KEY = Enum.KeyCode.H     -- esconde/mostra a interface
 local maxDistance = 2000            -- alcance do aimbot (studs)
 local espDistance = 2000            -- alcance do ESP (studs)
 local fovRadius = 150               -- raio da bola em pixels
 local BIND_NAME = "CameraLockHead"
+local TELEPORT_DISTANCE = 20        -- studs pra frente
 
 local lockEnabled = false
 local currentTarget = nil
 local espEnabled = false
 local espObjects = {}
+
+-- Aimbot (opções extras)
+local aimPartMode = "Tronco"        -- "Tronco" ou "Cabeça"
+local priorityMode = "Centro da tela" -- "Centro da tela", "Mais perto", "Menor vida"
+local smoothness = 0                -- 0 = instantâneo, 95 = bem suave
+local wallCheck = false             -- só trava em quem está visível
+local teamCheck = false             -- ignora quem é do seu time
+local predictionEnabled = false     -- previsão de movimento
+local predictionMs = 100            -- milissegundos de previsão
+local holdMode = false              -- só trava segurando botão direito
+local showTracer = true             -- linha até o alvo
+
+-- Free cam
+local fcEnabled = false
+local fcSpeed = 50
+local fcYaw, fcPitch = 0, 0
+local fcCurYaw, fcCurPitch = 0, 0
+local fcPos = Vector3.zero
+local fcVel = Vector3.zero
+local fcControls = nil
+local fcAnchoredRoot = nil
+local fcUp, fcDown = false, false
+local fcButtons = nil
+
+local FC_LOOK_PC = 0.003
+local FC_LOOK_TOUCH = 0.005
+local FC_ARROW_SPEED = 2
+local FC_LOOK_SMOOTH = 18
+local FC_MOVE_SMOOTH = 10
 
 -- Amigos que o aimbot ignora (nome de usuário, não DisplayName)
 local IGNORE_LIST = {
@@ -33,9 +63,16 @@ local function isIgnored(plr)
 	return IGNORE_LIST[plr.Name:lower()] == true
 end
 
+-- sincroniza os switches da interface (definidos mais abaixo)
+local syncAim = function() end
+local syncEsp = function() end
+
 ----------------------------------------------------------------
 -- CAMERA LOCK
 ----------------------------------------------------------------
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
 local function getHead(plr)
 	local char = plr.Character
 	if not char then return nil end
@@ -52,19 +89,45 @@ local function getAimPart(plr)
 	if not char then return nil end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	if not hum or hum.Health <= 0 then return nil end
+	if aimPartMode == "Cabeça" then
+		local head = char:FindFirstChild("Head")
+		if head then return head end
+	end
 	return char:FindFirstChild("UpperTorso")
 		or char:FindFirstChild("Torso")
 		or char:FindFirstChild("HumanoidRootPart")
 end
 
--- Procura o player mais perto do centro da tela, dentro da bola
+local function getAimPos(part)
+	if predictionEnabled then
+		return part.Position + part.AssemblyLinearVelocity * (predictionMs / 1000)
+	end
+	return part.Position
+end
+
+local function isVisible(part, plr)
+	local ignore = {camera}
+	if player.Character then
+		table.insert(ignore, player.Character)
+	end
+	rayParams.FilterDescendantsInstances = ignore
+	local origin = camera.CFrame.Position
+	local res = workspace:Raycast(origin, part.Position - origin, rayParams)
+	return res == nil or res.Instance:IsDescendantOf(plr.Character)
+end
+
+local function isTeammate(plr)
+	return teamCheck and plr.Team ~= nil and plr.Team == player.Team
+end
+
+-- Procura o melhor player dentro da bola
 local function findBestTarget()
-	local best, bestDist = nil, math.huge
+	local best, bestScore = nil, math.huge
 	local camPos = camera.CFrame.Position
 	local center = camera.ViewportSize / 2
 
 	for _, plr in ipairs(Players:GetPlayers()) do
-		if plr ~= player and not isIgnored(plr) then
+		if plr ~= player and not isIgnored(plr) and not isTeammate(plr) then
 			local part = getAimPart(plr)
 			if part then
 				local worldDist = (part.Position - camPos).Magnitude
@@ -72,9 +135,20 @@ local function findBestTarget()
 					local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
 					if onScreen and screenPos.Z > 0 then
 						local fromCenter = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
-						if fromCenter <= fovRadius and fromCenter < bestDist then
-							bestDist = fromCenter
-							best = plr
+						if fromCenter <= fovRadius and (not wallCheck or isVisible(part, plr)) then
+							local score
+							if priorityMode == "Mais perto" then
+								score = worldDist
+							elseif priorityMode == "Menor vida" then
+								local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+								score = hum and hum.Health or math.huge
+							else
+								score = fromCenter
+							end
+							if score < bestScore then
+								bestScore = score
+								best = plr
+							end
 						end
 					end
 				end
@@ -90,15 +164,25 @@ local function toggle()
 	if not lockEnabled then
 		currentTarget = nil
 	end
+	syncAim(lockEnabled)
 end
 
 RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, function()
+	if fcEnabled then return end
 	if not lockEnabled then return end
+
+	if holdMode and not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+		currentTarget = nil
+		return
+	end
 
 	-- mantém o alvo até ele chegar a 0 de HP (ou sair do alcance / do jogo)
 	if currentTarget then
 		local part = getAimPart(currentTarget)
-		if not part or (part.Position - camera.CFrame.Position).Magnitude > maxDistance then
+		if not part
+			or (part.Position - camera.CFrame.Position).Magnitude > maxDistance
+			or isTeammate(currentTarget)
+			or (wallCheck and not isVisible(part, currentTarget)) then
 			currentTarget = nil
 		end
 	end
@@ -112,7 +196,13 @@ RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, fun
 		local part = getAimPart(currentTarget)
 		if part then
 			local camPos = camera.CFrame.Position
-			camera.CFrame = CFrame.new(camPos, part.Position)
+			local goal = CFrame.new(camPos, getAimPos(part))
+			if smoothness > 0 then
+				local alpha = math.clamp(1 - smoothness / 100, 0.03, 1)
+				camera.CFrame = camera.CFrame:Lerp(goal, alpha)
+			else
+				camera.CFrame = goal
+			end
 		end
 	end
 end)
@@ -249,258 +339,696 @@ local function updateEsp()
 	end
 end
 
-----------------------------------------------------------------
--- INTERFACE
-----------------------------------------------------------------
-local gui = Instance.new("ScreenGui")
-gui.Name = "CameraLockGui"
-gui.ResetOnSpawn = false
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = player:WaitForChild("PlayerGui")
-
--- Bola (FOV) no centro da tela
-local circleGui = Instance.new("ScreenGui")
-circleGui.Name = "CameraLockCircle"
-circleGui.ResetOnSpawn = false
-circleGui.IgnoreGuiInset = true
-circleGui.Parent = player:WaitForChild("PlayerGui")
-
-local circle = Instance.new("Frame")
-circle.AnchorPoint = Vector2.new(0.5, 0.5)
-circle.Position = UDim2.fromScale(0.5, 0.5)
-circle.Size = UDim2.fromOffset(fovRadius * 2, fovRadius * 2)
-circle.BackgroundTransparency = 1
-circle.BorderSizePixel = 0
-circle.Parent = circleGui
-Instance.new("UICorner", circle).CornerRadius = UDim.new(1, 0)
-
-local circleStroke = Instance.new("UIStroke")
-circleStroke.Color = Color3.fromRGB(0, 140, 255)
-circleStroke.Thickness = 1.5
-circleStroke.Parent = circle
-
-local FULL_SIZE = UDim2.fromOffset(240, 272)
-local MINI_SIZE = UDim2.fromOffset(240, 32)
-
-local panel = Instance.new("Frame")
-panel.Name = "Panel"
-panel.Size = FULL_SIZE
-panel.Position = UDim2.new(1, -256, 0.5, -136)
-panel.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
-panel.BackgroundTransparency = 0.08
-panel.BorderSizePixel = 0
-panel.ClipsDescendants = true
-panel.Parent = gui
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
-
-local stroke = Instance.new("UIStroke")
-stroke.Color = Color3.fromRGB(90, 90, 120)
-stroke.Thickness = 1.5
-stroke.Parent = panel
-
-local titleBar = Instance.new("Frame")
-titleBar.Name = "TitleBar"
-titleBar.Size = UDim2.new(1, 0, 0, 32)
-titleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 44)
-titleBar.BorderSizePixel = 0
-titleBar.Parent = panel
-Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 10)
-
-local dot = Instance.new("Frame")
-dot.Size = UDim2.fromOffset(10, 10)
-dot.Position = UDim2.fromOffset(12, 11)
-dot.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
-dot.BorderSizePixel = 0
-dot.Parent = titleBar
-Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
-
-local title = Instance.new("TextLabel")
-title.BackgroundTransparency = 1
-title.Position = UDim2.fromOffset(30, 0)
-title.Size = UDim2.new(1, -70, 1, 0)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 13
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextColor3 = Color3.fromRGB(200, 200, 230)
-title.Text = "Admin Bloco splace"
-title.Parent = titleBar
-
-local minBtn = Instance.new("TextButton")
-minBtn.Size = UDim2.fromOffset(24, 20)
-minBtn.Position = UDim2.new(1, -32, 0, 6)
-minBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
-minBtn.BorderSizePixel = 0
-minBtn.Font = Enum.Font.GothamBold
-minBtn.TextSize = 14
-minBtn.TextColor3 = Color3.fromRGB(230, 230, 240)
-minBtn.Text = "–"
-minBtn.AutoButtonColor = true
-minBtn.Parent = titleBar
-Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
-
-local content = Instance.new("Frame")
-content.Name = "Content"
-content.BackgroundTransparency = 1
-content.Position = UDim2.fromOffset(0, 32)
-content.Size = UDim2.new(1, 0, 1, -32)
-content.Parent = panel
-
-local function makeLabel(y, h, size, color)
-	local l = Instance.new("TextLabel")
-	l.BackgroundTransparency = 1
-	l.Position = UDim2.fromOffset(12, y)
-	l.Size = UDim2.new(1, -24, 0, h)
-	l.Font = Enum.Font.Gotham
-	l.TextSize = size
-	l.TextXAlignment = Enum.TextXAlignment.Left
-	l.TextColor3 = color
-	l.Text = ""
-	l.Parent = content
-	return l
-end
-
-local function makeBox(y, text)
-	local b = Instance.new("TextBox")
-	b.Position = UDim2.new(1, -92, 0, y)
-	b.Size = UDim2.fromOffset(80, 24)
-	b.BackgroundColor3 = Color3.fromRGB(40, 40, 58)
-	b.BorderSizePixel = 0
-	b.Font = Enum.Font.GothamMedium
-	b.TextSize = 13
-	b.TextColor3 = Color3.fromRGB(240, 240, 250)
-	b.ClearTextOnFocus = false
-	b.Text = text
-	b.Parent = content
-	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-	return b
-end
-
-local statusLabel = makeLabel(4, 18, 13, Color3.fromRGB(230, 230, 240))
-local targetLabel = makeLabel(22, 16, 12, Color3.fromRGB(170, 170, 200))
-local distLabel = makeLabel(38, 16, 12, Color3.fromRGB(170, 170, 200))
-
--- Alcance do aimbot
-local aimText = makeLabel(62, 22, 12, Color3.fromRGB(170, 170, 200))
-aimText.Text = "Aimbot (studs):"
-local aimBox = makeBox(61, tostring(maxDistance))
-
-aimBox.FocusLost:Connect(function()
-	local n = tonumber(aimBox.Text)
-	if n then
-		maxDistance = math.clamp(math.floor(n), 50, 10000)
-	end
-	aimBox.Text = tostring(maxDistance)
-end)
-
--- Alcance do ESP
-local espText = makeLabel(92, 22, 12, Color3.fromRGB(170, 170, 200))
-espText.Text = "ESP (studs):"
-local espBox = makeBox(91, tostring(espDistance))
-
-espBox.FocusLost:Connect(function()
-	local n = tonumber(espBox.Text)
-	if n then
-		espDistance = math.clamp(math.floor(n), 50, 10000)
-	end
-	espBox.Text = tostring(espDistance)
-end)
-
--- Raio da bola
-local fovText = makeLabel(122, 22, 12, Color3.fromRGB(170, 170, 200))
-fovText.Text = "Raio da bola (px):"
-local fovBox = makeBox(121, tostring(fovRadius))
-
-fovBox.FocusLost:Connect(function()
-	local n = tonumber(fovBox.Text)
-	if n then
-		fovRadius = math.clamp(math.floor(n), 20, 1000)
-	end
-	fovBox.Text = tostring(fovRadius)
-	circle.Size = UDim2.fromOffset(fovRadius * 2, fovRadius * 2)
-end)
-
-local toggleBtn = Instance.new("TextButton")
-toggleBtn.Position = UDim2.fromOffset(12, 156)
-toggleBtn.Size = UDim2.new(1, -24, 0, 30)
-toggleBtn.BorderSizePixel = 0
-toggleBtn.Font = Enum.Font.GothamBold
-toggleBtn.TextSize = 13
-toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-toggleBtn.AutoButtonColor = true
-toggleBtn.Parent = content
-Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
-toggleBtn.Activated:Connect(toggle)
-
-local espBtn = Instance.new("TextButton")
-espBtn.Position = UDim2.fromOffset(12, 194)
-espBtn.Size = UDim2.new(1, -24, 0, 30)
-espBtn.BorderSizePixel = 0
-espBtn.Font = Enum.Font.GothamBold
-espBtn.TextSize = 13
-espBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-espBtn.AutoButtonColor = true
-espBtn.Parent = content
-Instance.new("UICorner", espBtn).CornerRadius = UDim.new(0, 8)
-
 local function toggleEsp()
 	espEnabled = not espEnabled
 	if not espEnabled then
 		clearEsp()
 	end
+	syncEsp(espEnabled)
 end
-espBtn.Activated:Connect(toggleEsp)
 
--- Minimizar
-local minimized = false
-minBtn.Activated:Connect(function()
-	minimized = not minimized
-	minBtn.Text = minimized and "+" or "–"
-	if minimized then
-		content.Visible = false
-		TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {Size = MINI_SIZE}):Play()
+----------------------------------------------------------------
+-- FREE CAM + TELEPORTAR
+----------------------------------------------------------------
+local function getOwnHumanoid()
+	local char = player.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getControls()
+	local ok, controls = pcall(function()
+		local scripts = player:FindFirstChild("PlayerScripts")
+		local module = scripts and scripts:FindFirstChild("PlayerModule")
+		return module and require(module):GetControls()
+	end)
+	return ok and controls or nil
+end
+
+local function startFreeCam()
+	if fcEnabled then return end
+	fcEnabled = true
+
+	local cf = camera.CFrame
+	fcPos = cf.Position
+	fcVel = Vector3.zero
+	fcPitch, fcYaw = cf:ToOrientation()
+	fcCurPitch, fcCurYaw = fcPitch, fcYaw
+	camera.CameraType = Enum.CameraType.Scriptable
+
+	if UserInputService.KeyboardEnabled then
+		fcControls = getControls()
+		if fcControls then fcControls:Disable() end
 	else
-		TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {Size = FULL_SIZE}):Play()
-		task.delay(0.1, function()
-			if not minimized then
-				content.Visible = true
-			end
-		end)
+		local char = player.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if root and not root.Anchored then
+			root.Anchored = true
+			fcAnchoredRoot = root
+		end
+		if fcButtons then fcButtons.Visible = true end
 	end
+end
+
+local function stopFreeCam()
+	if not fcEnabled then return end
+	fcEnabled = false
+	fcUp, fcDown = false, false
+	if fcButtons then fcButtons.Visible = false end
+
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	if fcControls then
+		fcControls:Enable()
+		fcControls = nil
+	end
+	if fcAnchoredRoot then
+		fcAnchoredRoot.Anchored = false
+		fcAnchoredRoot = nil
+	end
+
+	camera.CameraType = Enum.CameraType.Custom
+	local hum = getOwnHumanoid()
+	if hum then camera.CameraSubject = hum end
+end
+
+local function updateFreeCam(dt)
+	if not fcEnabled then return end
+
+	if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+	elseif UserInputService.MouseBehavior == Enum.MouseBehavior.LockCurrentPosition then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	end
+
+	local rot = CFrame.fromOrientation(fcPitch, fcYaw, 0)
+	local move = Vector3.zero
+
+	if UserInputService.KeyboardEnabled then
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += rot.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= rot.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += rot.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= rot.RightVector end
+	else
+		local hum = getOwnHumanoid()
+		if hum and hum.MoveDirection.Magnitude > 0 then
+			move += hum.MoveDirection
+		end
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.E) then move += Vector3.yAxis end
+	if UserInputService:IsKeyDown(Enum.KeyCode.Q) then move -= Vector3.yAxis end
+
+	if move.Magnitude > 0 then
+		local speed = fcSpeed
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+			speed = speed * 3
+		end
+		fcPos += move.Unit * speed * dt
+	end
+
+	camera.CFrame = CFrame.new(fcPos) * rot
+end
+
+local function teleportForward()
+	local char = player.Character
+	if not char then return end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not root or not hum then return end
+
+	local offset = root.CFrame.LookVector * TELEPORT_DISTANCE
+	local seat = hum.SeatPart
+
+	if seat then
+		-- sentado: leva o seat e tudo que está preso a ele (veículo, personagem, etc.)
+		for _, part in ipairs(seat:GetConnectedParts(true)) do
+			part.CFrame = part.CFrame + offset
+		end
+	else
+		char:PivotTo(char:GetPivot() + offset)
+	end
+end
+
+----------------------------------------------------------------
+-- INTERFACE (estilo Hub)
+----------------------------------------------------------------
+local C = {
+	bg = Color3.fromRGB(16, 16, 24),
+	side = Color3.fromRGB(22, 22, 34),
+	top = Color3.fromRGB(26, 26, 40),
+	row = Color3.fromRGB(30, 30, 46),
+	accent = Color3.fromRGB(0, 140, 255),
+	off = Color3.fromRGB(60, 60, 82),
+	text = Color3.fromRGB(235, 235, 245),
+	sub = Color3.fromRGB(150, 150, 180),
+	stroke = Color3.fromRGB(60, 60, 90),
+}
+
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do
+		o[k] = v
+	end
+	o.Parent = parent
+	return o
+end
+
+local function corner(o, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r)
+	c.Parent = o
+	return c
+end
+
+local gui = new("ScreenGui", {
+	Name = "CameraLockGui",
+	ResetOnSpawn = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, player:WaitForChild("PlayerGui"))
+
+-- Bola (FOV) no centro da tela
+local circleGui = new("ScreenGui", {
+	Name = "CameraLockCircle",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+}, player:WaitForChild("PlayerGui"))
+
+local circle = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(fovRadius * 2, fovRadius * 2),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+}, circleGui)
+corner(circle, 9999)
+
+local circleStroke = new("UIStroke", {
+	Color = C.accent,
+	Thickness = 1.5,
+}, circle)
+
+-- Linha até o alvo
+local tracer = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Size = UDim2.fromOffset(0, 1.5),
+	BackgroundColor3 = Color3.fromRGB(70, 200, 100),
+	BorderSizePixel = 0,
+	Visible = false,
+}, circleGui)
+
+-- Janela principal
+local WIN_SIZE = UDim2.fromOffset(500, 320)
+
+local window = new("Frame", {
+	Name = "Window",
+	Size = WIN_SIZE,
+	Position = UDim2.new(0.5, -250, 0.5, -160),
+	BackgroundColor3 = C.bg,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+}, gui)
+corner(window, 12)
+new("UIStroke", {Color = C.stroke, Thickness = 1.5}, window)
+
+-- Barra do topo
+local topBar = new("Frame", {
+	Name = "TopBar",
+	Size = UDim2.new(1, 0, 0, 38),
+	BackgroundColor3 = C.top,
+	BorderSizePixel = 0,
+}, window)
+corner(topBar, 12)
+new("Frame", { -- tapa os cantos de baixo da barra
+	Size = UDim2.new(1, 0, 0, 12),
+	Position = UDim2.new(0, 0, 1, -12),
+	BackgroundColor3 = C.top,
+	BorderSizePixel = 0,
+}, topBar)
+
+local dot = new("Frame", {
+	Size = UDim2.fromOffset(10, 10),
+	Position = UDim2.fromOffset(14, 14),
+	BackgroundColor3 = Color3.fromRGB(200, 60, 60),
+	BorderSizePixel = 0,
+}, topBar)
+corner(dot, 9999)
+
+new("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(32, 0),
+	Size = UDim2.new(0, 200, 1, 0),
+	Font = Enum.Font.GothamBold,
+	TextSize = 14,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextColor3 = C.text,
+	Text = "Admin Bloco splace",
+}, topBar)
+
+new("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.new(1, -230, 0, 0),
+	Size = UDim2.fromOffset(150, 38),
+	Font = Enum.Font.Gotham,
+	TextSize = 11,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	TextColor3 = C.sub,
+	Text = "Hub  |  [H] esconder",
+}, topBar)
+
+local minBtn = new("TextButton", {
+	Size = UDim2.fromOffset(28, 22),
+	Position = UDim2.new(1, -40, 0, 8),
+	BackgroundColor3 = C.off,
+	BorderSizePixel = 0,
+	Font = Enum.Font.GothamBold,
+	TextSize = 14,
+	TextColor3 = C.text,
+	Text = "–",
+	AutoButtonColor = true,
+}, topBar)
+corner(minBtn, 6)
+
+-- Barra lateral
+local sidebar = new("Frame", {
+	Name = "Sidebar",
+	Position = UDim2.fromOffset(0, 38),
+	Size = UDim2.new(0, 120, 1, -38),
+	BackgroundColor3 = C.side,
+	BorderSizePixel = 0,
+}, window)
+
+new("UIListLayout", {
+	Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+}, sidebar)
+new("UIPadding", {
+	PaddingTop = UDim.new(0, 10),
+	PaddingLeft = UDim.new(0, 8),
+	PaddingRight = UDim.new(0, 8),
+}, sidebar)
+
+local pagesHolder = new("Frame", {
+	Name = "Pages",
+	Position = UDim2.fromOffset(120, 38),
+	Size = UDim2.new(1, -120, 1, -38),
+	BackgroundTransparency = 1,
+}, window)
+
+local pages = {}
+local tabButtons = {}
+
+local function selectTab(name)
+	for n, page in pairs(pages) do
+		page.Visible = (n == name)
+		local btn = tabButtons[n]
+		TweenService:Create(btn, TweenInfo.new(0.15), {
+			BackgroundColor3 = (n == name) and C.accent or C.row,
+			TextColor3 = (n == name) and Color3.new(1, 1, 1) or C.sub,
+		}):Play()
+	end
+end
+
+local function addTab(name, order)
+	local btn = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 32),
+		LayoutOrder = order,
+		BackgroundColor3 = C.row,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextScaled = true,
+		TextColor3 = C.sub,
+		Text = name,
+		AutoButtonColor = false,
+	}, sidebar)
+	corner(btn, 8)
+	new("UITextSizeConstraint", {MaxTextSize = 13, MinTextSize = 8}, btn)
+
+	local page = new("ScrollingFrame", {
+		Name = name,
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = C.accent,
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Visible = false,
+	}, pagesHolder)
+	new("UIListLayout", {
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, page)
+	new("UIPadding", {
+		PaddingTop = UDim.new(0, 10),
+		PaddingLeft = UDim.new(0, 10),
+		PaddingRight = UDim.new(0, 10),
+		PaddingBottom = UDim.new(0, 10),
+	}, page)
+
+	pages[name] = page
+	tabButtons[name] = btn
+	btn.Activated:Connect(function()
+		selectTab(name)
+	end)
+	return page
+end
+
+local function addSection(page, text)
+	new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 18),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = C.accent,
+		Text = text,
+	}, page)
+end
+
+local function addInfo(page, text)
+	local l = new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 20),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = C.sub,
+		Text = text,
+	}, page)
+	return l
+end
+
+local function addButton(page, text, callback)
+	local btn = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = C.accent,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextColor3 = Color3.new(1, 1, 1),
+		Text = text,
+		AutoButtonColor = true,
+	}, page)
+	corner(btn, 8)
+	btn.Activated:Connect(callback)
+	return btn
+end
+
+local function addToggle(page, text, default, callback)
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = C.row,
+		BorderSizePixel = 0,
+	}, page)
+	corner(row, 8)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.new(1, -70, 1, 0),
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = C.text,
+		Text = text,
+	}, row)
+
+	local sw = new("Frame", {
+		Size = UDim2.fromOffset(40, 20),
+		Position = UDim2.new(1, -52, 0.5, -10),
+		BackgroundColor3 = C.off,
+		BorderSizePixel = 0,
+	}, row)
+	corner(sw, 10)
+
+	local knob = new("Frame", {
+		Size = UDim2.fromOffset(16, 16),
+		Position = UDim2.fromOffset(2, 2),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BorderSizePixel = 0,
+	}, sw)
+	corner(knob, 8)
+
+	local state = default
+	local function set(v, silent)
+		state = v
+		local info = TweenInfo.new(0.15, Enum.EasingStyle.Quad)
+		TweenService:Create(sw, info, {BackgroundColor3 = v and C.accent or C.off}):Play()
+		TweenService:Create(knob, info, {Position = v and UDim2.fromOffset(22, 2) or UDim2.fromOffset(2, 2)}):Play()
+		if not silent then
+			callback(v)
+		end
+	end
+
+	local btn = new("TextButton", {
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Text = "",
+	}, row)
+	btn.Activated:Connect(function()
+		set(not state)
+	end)
+
+	set(default, true)
+	return set
+end
+
+local function addInput(page, text, default, minV, maxV, callback)
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = C.row,
+		BorderSizePixel = 0,
+	}, page)
+	corner(row, 8)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(12, 0),
+		Size = UDim2.new(1, -110, 1, 0),
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = C.text,
+		Text = text,
+	}, row)
+
+	local box = new("TextBox", {
+		Position = UDim2.new(1, -92, 0.5, -12),
+		Size = UDim2.fromOffset(80, 24),
+		BackgroundColor3 = Color3.fromRGB(40, 40, 58),
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextColor3 = Color3.fromRGB(240, 240, 250),
+		ClearTextOnFocus = false,
+		Text = tostring(default),
+	}, row)
+	corner(box, 6)
+
+	local value = default
+	box.FocusLost:Connect(function()
+		local n = tonumber(box.Text)
+		if n then
+			value = math.clamp(math.floor(n), minV, maxV)
+			callback(value)
+		end
+		box.Text = tostring(value)
+	end)
+end
+
+-- Abas
+local aimPage = addTab("Aimbot", 1)
+local espPage = addTab("ESP", 2)
+local camPage = addTab("Free cam", 3)
+local cfgPage = addTab("Config", 4)
+
+-- Aba Aimbot
+addSection(aimPage, "AIMBOT")
+local setAim = addToggle(aimPage, "Ativar Lock  [J]", false, function(v)
+	lockEnabled = v
+	if not v then
+		currentTarget = nil
+	end
+end)
+syncAim = function(v)
+	setAim(v, true)
+end
+
+addInput(aimPage, "Alcance (studs)", maxDistance, 50, 10000, function(v)
+	maxDistance = v
+end)
+addInput(aimPage, "Raio da bola (px)", fovRadius, 20, 1000, function(v)
+	fovRadius = v
+	circle.Size = UDim2.fromOffset(fovRadius * 2, fovRadius * 2)
+end)
+addToggle(aimPage, "Mostrar bola FOV", true, function(v)
+	circle.Visible = v
+end)
+
+addSection(aimPage, "AJUSTES")
+addInput(aimPage, "Suavidade (0-95)", smoothness, 0, 95, function(v)
+	smoothness = v
+end)
+
+local partBtn
+partBtn = addButton(aimPage, "Mirar em: " .. aimPartMode, function()
+	aimPartMode = (aimPartMode == "Tronco") and "Cabeça" or "Tronco"
+	partBtn.Text = "Mirar em: " .. aimPartMode
+end)
+
+local PRIORITIES = {"Centro da tela", "Mais perto", "Menor vida"}
+local priorityBtn
+priorityBtn = addButton(aimPage, "Prioridade: " .. priorityMode, function()
+	local idx = table.find(PRIORITIES, priorityMode) or 1
+	priorityMode = PRIORITIES[(idx % #PRIORITIES) + 1]
+	priorityBtn.Text = "Prioridade: " .. priorityMode
+	currentTarget = nil
+end)
+
+addToggle(aimPage, "Checar parede (só visíveis)", false, function(v)
+	wallCheck = v
+end)
+addToggle(aimPage, "Ignorar meu time", false, function(v)
+	teamCheck = v
+end)
+addToggle(aimPage, "Só segurando botão direito", false, function(v)
+	holdMode = v
+end)
+addToggle(aimPage, "Previsão de movimento", false, function(v)
+	predictionEnabled = v
+end)
+addInput(aimPage, "Previsão (ms)", predictionMs, 0, 500, function(v)
+	predictionMs = v
+end)
+addToggle(aimPage, "Linha até o alvo", true, function(v)
+	showTracer = v
+end)
+
+addSection(aimPage, "STATUS")
+local statusLabel = addInfo(aimPage, "Lock: DESATIVADO")
+local targetLabel = addInfo(aimPage, "Alvo: —")
+local distLabel = addInfo(aimPage, "Distância: —")
+
+-- Aba ESP
+addSection(espPage, "ESP")
+local setEspSwitch = addToggle(espPage, "Ativar ESP  [Y]", false, function(v)
+	espEnabled = v
+	if not v then
+		clearEsp()
+	end
+end)
+syncEsp = function(v)
+	setEspSwitch(v, true)
+end
+
+addInput(espPage, "Alcance (studs)", espDistance, 50, 10000, function(v)
+	espDistance = v
+end)
+
+-- Aba Free cam
+addSection(camPage, "FREE CAM")
+addToggle(camPage, "Soltar câmera do corpo", false, function(v)
+	if v then
+		startFreeCam()
+	else
+		stopFreeCam()
+	end
+end)
+addInput(camPage, "Velocidade", fcSpeed, 1, 1000, function(v)
+	fcSpeed = v
+end)
+addInfo(camPage, "PC: WASD move, Q/E desce/sobe, Shift acelera")
+addInfo(camPage, "PC: segure botão direito pra girar a câmera")
+addInfo(camPage, "Celular: joystick move, arraste a tela pra girar")
+
+addSection(camPage, "TELEPORTE")
+addButton(camPage, "Teleportar", teleportForward)
+
+-- Aba Config
+addSection(cfgPage, "TECLAS")
+addInfo(cfgPage, "[J]  Liga/desliga o Aimbot")
+addInfo(cfgPage, "[Y]  Liga/desliga o ESP")
+addInfo(cfgPage, "[H]  Esconde/mostra a interface")
+
+selectTab("Aimbot")
+
+-- Botão flutuante (ao minimizar)
+local floatBtn = new("TextButton", {
+	Name = "FloatBtn",
+	Size = UDim2.fromOffset(44, 44),
+	Position = UDim2.new(0, 20, 0.5, -22),
+	BackgroundColor3 = C.bg,
+	BorderSizePixel = 0,
+	Font = Enum.Font.GothamBold,
+	TextSize = 18,
+	TextColor3 = C.accent,
+	Text = "A",
+	AutoButtonColor = true,
+	Visible = false,
+}, gui)
+corner(floatBtn, 22)
+new("UIStroke", {Color = C.accent, Thickness = 1.5}, floatBtn)
+
+minBtn.Activated:Connect(function()
+	window.Visible = false
+	floatBtn.Visible = true
+end)
+floatBtn.Activated:Connect(function()
+	window.Visible = true
+	floatBtn.Visible = false
 end)
 
 -- Arrastar (mouse e toque)
-local dragging = false
-local dragStart, startPos
+local function makeDraggable(handle, target)
+	local dragging = false
+	local dragStart, startPos
 
-titleBar.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1
-		or input.UserInputType == Enum.UserInputType.Touch then
-		dragging = true
-		dragStart = input.Position
-		startPos = panel.Position
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = target.Position
 
-		input.Changed:Connect(function()
-			if input.UserInputState == Enum.UserInputState.End then
-				dragging = false
-			end
-		end)
-	end
-end)
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
 
-UserInputService.InputChanged:Connect(function(input)
-	if not dragging then return end
-	if input.UserInputType == Enum.UserInputType.MouseMovement
-		or input.UserInputType == Enum.UserInputType.Touch then
-		local delta = input.Position - dragStart
-		panel.Position = UDim2.new(
-			startPos.X.Scale, startPos.X.Offset + delta.X,
-			startPos.Y.Scale, startPos.Y.Offset + delta.Y
-		)
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then return end
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			target.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+end
+
+makeDraggable(topBar, window)
+
+-- Giro da free cam (botão direito no PC / arrastar no celular)
+UserInputService.InputChanged:Connect(function(input, gameProcessed)
+	if not fcEnabled then return end
+
+	if input.UserInputType == Enum.UserInputType.MouseMovement then
+		if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+			fcYaw = fcYaw - input.Delta.X * 0.003
+			fcPitch = math.clamp(fcPitch - input.Delta.Y * 0.003, -1.5, 1.5)
+		end
+	elseif input.UserInputType == Enum.UserInputType.Touch and not gameProcessed then
+		fcYaw = fcYaw - input.Delta.X * 0.004
+		fcPitch = math.clamp(fcPitch - input.Delta.Y * 0.004, -1.5, 1.5)
 	end
 end)
 
 -- Atualização ao vivo
-RunService.RenderStepped:Connect(function()
+RunService.RenderStepped:Connect(function(dt)
 	local locked = currentTarget ~= nil
 
 	dot.BackgroundColor3 = lockEnabled and Color3.fromRGB(70, 200, 100) or Color3.fromRGB(200, 60, 60)
@@ -511,25 +1039,36 @@ RunService.RenderStepped:Connect(function()
 	else
 		statusLabel.Text = "Lock: DESATIVADO"
 	end
-	toggleBtn.Text = lockEnabled and "DESATIVAR LOCK  [Q]" or "ATIVAR LOCK  [Q]"
-	toggleBtn.BackgroundColor3 = lockEnabled and Color3.fromRGB(190, 70, 70) or Color3.fromRGB(60, 150, 90)
 
-	espBtn.Text = espEnabled and "DESATIVAR ESP  [E]" or "ATIVAR ESP  [E]"
-	espBtn.BackgroundColor3 = espEnabled and Color3.fromRGB(190, 70, 70) or Color3.fromRGB(70, 110, 190)
+	circleStroke.Color = locked and Color3.fromRGB(70, 200, 100) or C.accent
 
-	circleStroke.Color = locked and Color3.fromRGB(70, 200, 100) or Color3.fromRGB(0, 140, 255)
-
+	local tracerShown = false
 	if locked then
 		targetLabel.Text = "Alvo: " .. currentTarget.DisplayName
 		local part = getAimPart(currentTarget)
 		if part then
 			distLabel.Text = string.format("Distância: %d studs", math.floor((part.Position - camera.CFrame.Position).Magnitude))
+
+			if showTracer then
+				local sp, onScreen = camera:WorldToViewportPoint(part.Position)
+				if onScreen and sp.Z > 0 then
+					local c = camera.ViewportSize / 2
+					local p = Vector2.new(sp.X, sp.Y)
+					local d = p - c
+					tracer.Size = UDim2.fromOffset(d.Magnitude, 1.5)
+					tracer.Position = UDim2.fromOffset((c.X + p.X) / 2, (c.Y + p.Y) / 2)
+					tracer.Rotation = math.deg(math.atan2(d.Y, d.X))
+					tracerShown = true
+				end
+			end
 		end
 	else
 		targetLabel.Text = "Alvo: —"
 		distLabel.Text = "Distância: —"
 	end
+	tracer.Visible = tracerShown
 
+	updateFreeCam(dt)
 	updateEsp()
 end)
 
