@@ -38,19 +38,9 @@ local showTracer = true             -- linha até o alvo
 local fcEnabled = false
 local fcSpeed = 50
 local fcYaw, fcPitch = 0, 0
-local fcCurYaw, fcCurPitch = 0, 0
 local fcPos = Vector3.zero
-local fcVel = Vector3.zero
 local fcControls = nil
 local fcAnchoredRoot = nil
-local fcUp, fcDown = false, false
-local fcButtons = nil
-
-local FC_LOOK_PC = 0.003
-local FC_LOOK_TOUCH = 0.005
-local FC_ARROW_SPEED = 2
-local FC_LOOK_SMOOTH = 18
-local FC_MOVE_SMOOTH = 10
 
 -- Amigos que o aimbot ignora (nome de usuário, não DisplayName)
 local IGNORE_LIST = {
@@ -370,30 +360,29 @@ local function startFreeCam()
 
 	local cf = camera.CFrame
 	fcPos = cf.Position
-	fcVel = Vector3.zero
 	fcPitch, fcYaw = cf:ToOrientation()
-	fcCurPitch, fcCurYaw = fcPitch, fcYaw
 	camera.CameraType = Enum.CameraType.Scriptable
 
 	if UserInputService.KeyboardEnabled then
+		-- PC: desliga o controle do personagem pra ele não andar junto
 		fcControls = getControls()
-		if fcControls then fcControls:Disable() end
+		if fcControls then
+			fcControls:Disable()
+		end
 	else
+		-- celular: usa o joystick pra mover a câmera e prende o corpo
 		local char = player.Character
 		local root = char and char:FindFirstChild("HumanoidRootPart")
 		if root and not root.Anchored then
 			root.Anchored = true
 			fcAnchoredRoot = root
 		end
-		if fcButtons then fcButtons.Visible = true end
 	end
 end
 
 local function stopFreeCam()
 	if not fcEnabled then return end
 	fcEnabled = false
-	fcUp, fcDown = false, false
-	if fcButtons then fcButtons.Visible = false end
 
 	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
 	if fcControls then
@@ -407,7 +396,9 @@ local function stopFreeCam()
 
 	camera.CameraType = Enum.CameraType.Custom
 	local hum = getOwnHumanoid()
-	if hum then camera.CameraSubject = hum end
+	if hum then
+		camera.CameraSubject = hum
+	end
 end
 
 local function updateFreeCam(dt)
